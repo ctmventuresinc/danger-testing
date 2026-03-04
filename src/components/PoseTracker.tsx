@@ -9,7 +9,8 @@ import {
 export default function PoseTracker() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const glowCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const segmenterRef = useRef<ImageSegmenter | null>(null);
   const animationFrameRef = useRef<number>(0);
   const [isLoading, setIsLoading] = useState(true);
@@ -25,7 +26,7 @@ export default function PoseTracker() {
       segmenterRef.current = await ImageSegmenter.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+            "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
           delegate: "GPU",
         },
         runningMode: "VIDEO",
@@ -77,94 +78,75 @@ export default function PoseTracker() {
     canvas.width = w;
     canvas.height = h;
 
-    if (!offscreenCanvasRef.current) {
-      offscreenCanvasRef.current = document.createElement("canvas");
+    // Init offscreen canvases once
+    if (!maskCanvasRef.current) {
+      maskCanvasRef.current = document.createElement("canvas");
+      glowCanvasRef.current = document.createElement("canvas");
     }
-    const offscreen = offscreenCanvasRef.current;
-    offscreen.width = w;
-    offscreen.height = h;
+    const maskCanvas = maskCanvasRef.current;
+    const glowCanvas = glowCanvasRef.current!;
+    maskCanvas.width = w;
+    maskCanvas.height = h;
+    glowCanvas.width = w;
+    glowCanvas.height = h;
 
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    const offCtx = offscreen.getContext("2d", { willReadFrequently: true });
-    if (!ctx || !offCtx) return;
+    const ctx = canvas.getContext("2d")!;
+    const maskCtx = maskCanvas.getContext("2d")!;
+    const glowCtx = glowCanvas.getContext("2d")!;
 
     const result = segmenter.segmentForVideo(video, performance.now());
 
-    // Draw the original video as background
+    // Draw original video as background
     ctx.drawImage(video, 0, 0, w, h);
 
     if (result.confidenceMasks && result.confidenceMasks.length > 0) {
-      // The selfie_multiclass model returns multiple masks
-      // Index 0 = background, others are body parts
-      // We want any non-background (person) pixels
-      // For selfie_multiclass: 0=background, 1=hair, 2=body-skin, 3=face-skin, 4=clothes, 5=others(accessories)
-      const masks = result.confidenceMasks;
+      const mask = result.confidenceMasks[0];
+      const maskData = mask.getAsFloat32Array();
 
-      // Build combined person mask from all non-background channels
-      const personMask = new Float32Array(w * h);
-      for (let i = 1; i < masks.length; i++) {
-        const maskData = masks[i].getAsFloat32Array();
-        for (let j = 0; j < maskData.length; j++) {
-          personMask[j] = Math.min(1, personMask[j] + maskData[j]);
-        }
+      // Build mask as alpha image on maskCanvas
+      const imageData = maskCtx.createImageData(w, h);
+      const pixels = imageData.data;
+
+      for (let i = 0; i < maskData.length; i++) {
+        const confidence = maskData[i];
+        const idx = i * 4;
+        // White pixel with alpha based on confidence
+        pixels[idx] = 255;
+        pixels[idx + 1] = 255;
+        pixels[idx + 2] = 255;
+        pixels[idx + 3] = confidence > 0.5 ? 255 : 0;
       }
 
-      // Create gradient on offscreen canvas
-      offCtx.clearRect(0, 0, w, h);
-      const gradient = offCtx.createLinearGradient(0, h, 0, 0);
-      gradient.addColorStop(0, "#0033FF");    // deep blue at feet
-      gradient.addColorStop(0.3, "#4400CC");  // blue-purple
-      gradient.addColorStop(0.55, "#7700AA"); // purple
-      gradient.addColorStop(0.75, "#AA0088"); // purple-pink
-      gradient.addColorStop(1, "#FF00AA");    // hot pink at top
-      offCtx.fillStyle = gradient;
-      offCtx.fillRect(0, 0, w, h);
+      maskCtx.putImageData(imageData, 0, 0);
 
-      // Get gradient pixels
-      const gradientData = offCtx.getImageData(0, 0, w, h);
-      const gradPixels = gradientData.data;
+      // Draw gradient on glowCanvas, masked by body shape
+      glowCtx.clearRect(0, 0, w, h);
 
-      // Apply mask to gradient — set alpha based on confidence
-      for (let i = 0; i < personMask.length; i++) {
-        const confidence = personMask[i];
-        const pIdx = i * 4;
-        if (confidence < 0.4) {
-          gradPixels[pIdx + 3] = 0; // fully transparent
-        } else {
-          gradPixels[pIdx + 3] = Math.floor(confidence * 220); // semi-transparent overlay
-        }
-      }
+      // First draw the mask
+      glowCtx.drawImage(maskCanvas, 0, 0);
 
-      offCtx.putImageData(gradientData, 0, 0);
+      // Then draw gradient only inside the mask using source-in
+      glowCtx.globalCompositeOperation = "source-in";
+      const gradient = glowCtx.createLinearGradient(0, h, 0, 0);
+      gradient.addColorStop(0, "#0033FF");
+      gradient.addColorStop(0.3, "#4400CC");
+      gradient.addColorStop(0.55, "#7700AA");
+      gradient.addColorStop(0.75, "#AA0088");
+      gradient.addColorStop(1, "#FF00AA");
+      glowCtx.fillStyle = gradient;
+      glowCtx.fillRect(0, 0, w, h);
+      glowCtx.globalCompositeOperation = "source-over";
 
-      // Draw glow effect — draw the silhouette multiple times with increasing shadow
+      // Draw glow on main canvas
       ctx.save();
-
-      // Outer glow layer
       ctx.shadowColor = "#FF00FF";
-      ctx.shadowBlur = 30;
+      ctx.shadowBlur = 25;
       ctx.globalCompositeOperation = "screen";
-      ctx.drawImage(offscreen, 0, 0);
-      ctx.drawImage(offscreen, 0, 0);
-
-      // Inner sharper glow
-      ctx.shadowBlur = 10;
-      ctx.shadowColor = "#CC44FF";
-      ctx.drawImage(offscreen, 0, 0);
-
+      ctx.drawImage(glowCanvas, 0, 0);
+      ctx.drawImage(glowCanvas, 0, 0);
       ctx.restore();
 
-      // Draw the gradient silhouette on top cleanly
-      ctx.save();
-      ctx.globalCompositeOperation = "screen";
-      ctx.globalAlpha = 0.85;
-      ctx.drawImage(offscreen, 0, 0);
-      ctx.restore();
-
-      // Close masks to free memory
-      for (const mask of masks) {
-        mask.close();
-      }
+      mask.close();
     }
 
     animationFrameRef.current = requestAnimationFrame(renderFrame);
